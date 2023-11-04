@@ -2,12 +2,19 @@
 
 use bevy::diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin};
 use bevy::ecs::query::Has;
-use bevy::{prelude::*, gizmos};
+use bevy::gizmos;
+use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages};
+use bevy::sprite::MaterialMesh2dBundle;
 use bevy::utils::{HashMap, HashSet};
 use bevy::window::{PresentMode, WindowResolution};
 use bevy_pixel_camera::{PixelCameraBundle, PixelCameraPlugin};
+use bevy_rapier2d::prelude::{Ccd, Collider, NoUserData, RapierPhysicsPlugin, Restitution, RigidBody, Velocity};
+use bevy_rapier2d::render::{DebugRenderContext, RapierDebugRenderPlugin};
 use rand::Rng;
+
+#[derive(Component)]
+struct Player;
 
 #[derive(Component)]
 struct MySprite(usize);
@@ -34,11 +41,41 @@ fn main() {
           ..default()
         }),
     )
+    .add_plugins(RapierPhysicsPlugin::<NoUserData>::pixels_per_meter(2.0))
+    .add_plugins(RapierDebugRenderPlugin::default())
     .add_plugins((PixelCameraPlugin, FrameTimeDiagnosticsPlugin))
     .add_plugins(LogDiagnosticsPlugin::default())
     .add_systems(Startup, setup)
-    .add_systems(Update, (setup2, flip_sprites, remove_hull_vec, render_strip).chain())
+    .add_systems(
+      Update,
+      (setup2, flip_sprites, remove_hull_vec, render_strip, movement).chain(),
+    )
     .run();
+}
+
+fn movement(
+  mut player: Query<&mut Velocity, With<Player>>,
+  input: Res<Input<KeyCode>>,
+  time: Res<Time>,
+  mut debug_render_context: ResMut<DebugRenderContext>,
+) {
+  let Ok(mut vel) = player.get_single_mut() else {
+    return;
+  };
+
+  if input.just_pressed(KeyCode::D) {
+    debug_render_context.enabled = !debug_render_context.enabled;
+  }
+
+  if input.just_pressed(KeyCode::Space) {
+    vel.linvel.y = 100.;
+  }
+  if input.pressed(KeyCode::Left) {
+    vel.linvel.x -= 80. * time.delta_seconds();
+  }
+  if input.pressed(KeyCode::Right) {
+    vel.linvel.x += 80. * time.delta_seconds();
+  }
 }
 
 fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
@@ -61,6 +98,8 @@ fn setup2(
   asset_server: Res<AssetServer>,
   mut images: ResMut<Assets<Image>>,
   hull_handle: Option<ResMut<HullHandle>>,
+  mut meshes: ResMut<Assets<Mesh>>,
+  mut materials: ResMut<Assets<ColorMaterial>>,
 ) {
   if hull_handle.is_some() {
     return;
@@ -102,7 +141,44 @@ fn setup2(
     MySprite(2),
   ));
 
+  let collider_hulls = hulls.clone();
   commands.insert_resource(HullHandle(loaded_map, hull_image_handle.clone(), hulls));
+
+  for hull in collider_hulls.iter() {
+    let mut hull = hull.clone();
+    while remove_least_errorful_hull_vec(&mut hull, 12.) {}
+    let polygon_indices = split_into_convex_polygons(&hull, None);
+
+    for polygon_idc in polygon_indices.iter() {
+      let mut polygon = Vec::new();
+
+      for i in polygon_idc {
+        polygon.push(convert_vec2(hull[*i]));
+      }
+
+      commands
+        .spawn(Collider::convex_hull(&polygon).unwrap())
+        .insert(TransformBundle::from(Transform::from_xyz(0.0, 0.0, 0.0)));
+    }
+  }
+
+  /* Create the bouncing ball. */
+  commands
+    .spawn(RigidBody::Dynamic)
+    .insert(
+      // Circle
+      MaterialMesh2dBundle {
+        mesh: meshes.add(shape::Circle::new(5.).into()).into(),
+        material: materials.add(ColorMaterial::from(Color::PURPLE)),
+        ..default()
+      },
+    )
+    .insert(Collider::ball(5.0))
+    .insert(Restitution::coefficient(0.7))
+    .insert(TransformBundle::from(Transform::from_xyz(0.0, 100.0, 1.0)))
+    .insert(Ccd::default())
+    .insert(Player)
+    .insert(Velocity::default());
 
   /*let size = Extent3d {
     width: 200,
@@ -249,25 +325,19 @@ fn render_hull_to_image(image: &Image, hull_pixels: &Vec<(i32, i32)>) -> Image {
   new_image
 }
 
-fn draw_line(
-  gizmos: &mut Gizmos,
-  start: Vec2,
-  end: Vec2,
-  color0: Color,
-  color1: Color,
-) {
+fn convert_vec2(v: Vec2) -> Vec2 {
+  Vec2::new(v.x - 149.5, -v.y + 149.5)
+}
+
+fn draw_line(gizmos: &mut Gizmos, start: Vec2, end: Vec2, color0: Color, color1: Color) {
   let mut cur = start;
   let mut next = end;
 
-  cur.y = -cur.y + 149.5;
-  next.y = -next.y + 149.5;
-  cur.x -= 149.5;
-  next.x -= 149.5;
-
-  gizmos.line_gradient_2d(cur, next, color0, color1);
+  gizmos.line_gradient_2d(convert_vec2(cur), convert_vec2(next), color0, color1);
 }
 
 fn render_strip(mut gizmos: Gizmos, hull_handle: Option<ResMut<HullHandle>>, keyboard_input: Res<Input<KeyCode>>) {
+  return;
   let hull_handle = match hull_handle {
     Some(hull_handle) => hull_handle,
     None => return,
@@ -277,13 +347,19 @@ fn render_strip(mut gizmos: Gizmos, hull_handle: Option<ResMut<HullHandle>>, key
 
   for hull in hulls.iter() {
     if !keyboard_input.pressed(KeyCode::AltLeft) {
-      let polygons = split_into_convex_polygons(hull, &mut gizmos);
+      let polygons = split_into_convex_polygons(hull, Some(&mut gizmos));
       for polygon in polygons.iter() {
         for i in 0..polygon.len() {
           let cur = hull[polygon[i]];
           let next = hull[polygon[(i + 1) % polygon.len()]];
 
-          draw_line(&mut gizmos, cur, next, Color::rgb(0.5, 0.5, 1.0), Color::rgb(0.5, 1.0, 0.5));
+          draw_line(
+            &mut gizmos,
+            cur,
+            next,
+            Color::rgb(0.5, 0.5, 1.0),
+            Color::rgb(0.5, 1.0, 0.5),
+          );
         }
       }
     } else {
@@ -291,7 +367,13 @@ fn render_strip(mut gizmos: Gizmos, hull_handle: Option<ResMut<HullHandle>>, key
         let cur = hull[i];
         let next = hull[(i + 1) % hull.len()];
 
-        draw_line(&mut gizmos, cur, next, Color::rgb(0.5, 0.5, 1.0), Color::rgb(0.5, 1.0, 0.5));
+        draw_line(
+          &mut gizmos,
+          cur,
+          next,
+          Color::rgb(0.5, 0.5, 1.0),
+          Color::rgb(0.5, 1.0, 0.5),
+        );
       }
     }
   }
@@ -299,6 +381,7 @@ fn render_strip(mut gizmos: Gizmos, hull_handle: Option<ResMut<HullHandle>>, key
 
 // a system that changes the z position of all MySprite components when the space bar is pressed
 fn flip_sprites(mut query: Query<(&mut Visibility, &mut MySprite)>, keyboard_input: Res<Input<KeyCode>>) {
+  return;
   if keyboard_input.just_pressed(KeyCode::Space) {
     println!("Flipping sprites!");
     for (mut vis, mut sprite) in query.iter_mut() {
@@ -488,7 +571,7 @@ fn remove_least_errorful_hull_vec(hull: &mut Vec<Vec2>, max_remove: f32) -> bool
   }
 }
 
-fn split_into_convex_polygons(hull: &Vec<Vec2>, gizmos: &mut Gizmos) -> Vec<Vec<usize>> {
+fn split_into_convex_polygons(hull: &Vec<Vec2>, gizmos: Option<&mut Gizmos>) -> Vec<Vec<usize>> {
   let mut indices: Vec<usize> = (0..hull.len()).collect();
   let mut polygons = Vec::new();
 
@@ -530,11 +613,13 @@ fn split_into_convex_polygons(hull: &Vec<Vec2>, gizmos: &mut Gizmos) -> Vec<Vec<
       start %= indices.len();
       if start == 0 {
         if debug {
-          for i in 0..indices.len() {
-            let cur = hull[indices[i]];
-            let next = hull[indices[(i + 1) % indices.len()]];
+          if let Some(gizmos) = gizmos {
+            for i in 0..indices.len() {
+              let cur = hull[indices[i]];
+              let next = hull[indices[(i + 1) % indices.len()]];
 
-            draw_line(gizmos, cur, next, Color::rgb(1.0, 0.0, 0.), Color::rgb(1.0, 0., 0.));
+              draw_line(gizmos, cur, next, Color::rgb(1.0, 0.0, 0.), Color::rgb(1.0, 0., 0.));
+            }
           }
           polygons.push(indices);
           return Vec::new();
@@ -634,7 +719,7 @@ fn split_into_convex_polygons(hull: &Vec<Vec2>, gizmos: &mut Gizmos) -> Vec<Vec<
   polygons
 }
 
-/* 
+/*
 #[cfg(test)]
 mod tests {
   use bevy::prelude::Vec2;
