@@ -5,13 +5,42 @@ use bevy::ecs::query::Has;
 use bevy::gizmos;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages};
-use bevy::sprite::MaterialMesh2dBundle;
+use bevy::sprite::{MaterialMesh2dBundle, Anchor};
 use bevy::utils::{HashMap, HashSet};
 use bevy::window::{PresentMode, WindowResolution};
 use bevy_pixel_camera::{PixelCameraBundle, PixelCameraPlugin};
 use bevy_rapier2d::prelude::{Ccd, Collider, NoUserData, RapierPhysicsPlugin, Restitution, RigidBody, Velocity};
 use bevy_rapier2d::render::{DebugRenderContext, RapierDebugRenderPlugin};
 use rand::Rng;
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize)]
+struct CollisionData {
+  hulls: Vec<CollisionHullData>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CollisionHullData {
+  hull_index: usize,
+  convex_polygons: Vec<(f32, f32)>,
+}
+
+impl CollisionData {
+  fn from(hulls: Vec<Vec<Vec2>>) -> Self {
+    let hulls = hulls
+      .iter()
+      .enumerate()
+      .map(|(idx, hull)| {
+        let convex_polygons = hull.iter().map(|v| (v.x, v.y)).collect();
+        CollisionHullData {
+          hull_index: idx,
+          convex_polygons,
+        }
+      })
+      .collect();
+    Self { hulls }
+  }
+}
 
 #[derive(Component)]
 struct Player;
@@ -48,7 +77,7 @@ fn main() {
     .add_systems(Startup, setup)
     .add_systems(
       Update,
-      (setup2, flip_sprites, remove_hull_vec, render_strip, movement).chain(),
+      (setup2, flip_sprites, remove_hull_vec, render_strip, movement, sync_camera_to_player).chain(),
     )
     .run();
 }
@@ -81,12 +110,16 @@ fn movement(
 fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
   commands.spawn(PixelCameraBundle::from_resolution(300, 300, false));
 
-  let loaded_map = asset_server.load("map.png");
+  let loaded_map = asset_server.load("map2.png");
 
   commands.spawn((
     SpriteBundle {
       texture: loaded_map.clone(),
       transform: Transform::from_xyz(0., 0., 0.0),
+      sprite: Sprite {
+        anchor: Anchor::TopLeft,
+        ..Default::default()
+      },
       ..default()
     },
     MySprite(0),
@@ -104,10 +137,30 @@ fn setup2(
   if hull_handle.is_some() {
     return;
   }
-  let loaded_map = asset_server.load("map.png");
+  let loaded_map = asset_server.load("map2.png");
   let Some(map_image) = images.get(&loaded_map) else {
     return;
   };
+
+  /* Create the bouncing ball. */
+  commands
+    .spawn(RigidBody::Dynamic)
+    .insert(
+      // Circle
+      MaterialMesh2dBundle {
+        mesh: meshes.add(shape::Circle::new(5.).into()).into(),
+        material: materials.add(ColorMaterial::from(Color::PURPLE)),
+        ..default()
+      },
+    )
+    .insert(Collider::ball(5.0))
+    .insert(Restitution::coefficient(0.7))
+    .insert(TransformBundle::from(Transform::from_xyz(100.0, 0.0, 1.0)))
+    .insert(Ccd::default())
+    .insert(Player)
+    .insert(Velocity::default());
+
+  print!("Image: {:?}", map_image.texture_descriptor);
   let hull = find_hull_pixels(map_image);
   let hull_image = render_hull_to_image(map_image, &hull);
 
@@ -117,6 +170,10 @@ fn setup2(
     SpriteBundle {
       texture: hull_image_handle.clone(),
       transform: Transform::from_xyz(0., 0., 0.0),
+      sprite: Sprite {
+        anchor: Anchor::TopLeft,
+        ..Default::default()
+      },
       ..default()
     },
     MySprite(1),
@@ -136,6 +193,10 @@ fn setup2(
     SpriteBundle {
       texture: hull_image_handle.clone(),
       transform: Transform::from_xyz(0., 0., 0.0),
+      sprite: Sprite {
+        anchor: Anchor::TopLeft,
+        ..Default::default()
+      },
       ..default()
     },
     MySprite(2),
@@ -143,18 +204,25 @@ fn setup2(
 
   let collider_hulls = hulls.clone();
   commands.insert_resource(HullHandle(loaded_map, hull_image_handle.clone(), hulls));
+  let mut result_hull = Vec::new();
 
+  fn correct_coords(v: Vec2) -> Vec2 {
+    Vec2::new(v.x + 0.5, -v.y - 0.5)
+  }
+
+  let image = images.get(&hull_image_handle).unwrap();
   for hull in collider_hulls.iter() {
     let mut hull = hull.clone();
-    while remove_least_errorful_hull_vec(&mut hull, 12.) {}
-    let polygon_indices = split_into_convex_polygons(&hull, None);
+    while remove_least_errorful_hull_vec(&mut hull, 10.) {}
+    let polygon_indices = split_into_convex_polygons(&hull, None, image);
 
     for polygon_idc in polygon_indices.iter() {
       let mut polygon = Vec::new();
 
       for i in polygon_idc {
-        polygon.push(convert_vec2(hull[*i]));
+        polygon.push(correct_coords(hull[*i]));
       }
+      result_hull.push(polygon.clone());
 
       commands
         .spawn(Collider::convex_hull(&polygon).unwrap())
@@ -162,23 +230,8 @@ fn setup2(
     }
   }
 
-  /* Create the bouncing ball. */
-  commands
-    .spawn(RigidBody::Dynamic)
-    .insert(
-      // Circle
-      MaterialMesh2dBundle {
-        mesh: meshes.add(shape::Circle::new(5.).into()).into(),
-        material: materials.add(ColorMaterial::from(Color::PURPLE)),
-        ..default()
-      },
-    )
-    .insert(Collider::ball(5.0))
-    .insert(Restitution::coefficient(0.7))
-    .insert(TransformBundle::from(Transform::from_xyz(0.0, 100.0, 1.0)))
-    .insert(Ccd::default())
-    .insert(Player)
-    .insert(Velocity::default());
+
+  serde_json::to_writer(std::fs::File::create("out.json").unwrap(), &CollisionData::from(result_hull)).unwrap();
 
   /*let size = Extent3d {
     width: 200,
@@ -233,44 +286,56 @@ fn setup2(
   ));*/
 }
 
+fn is_ground_pixel(image: &Image, x: i32, y: i32) -> bool {
+  if x < 0 || x >= image.texture_descriptor.size.width as i32 {
+    return false;
+  }
+  if y < 0 || y >= image.texture_descriptor.size.height as i32 {
+    return false;
+  }
+
+  let index = ((x + y * image.texture_descriptor.size.width as i32) * 4) as usize + 3;
+  let pixel = image.data[index];
+  pixel > 0
+}
+
 // find all black pixels that are surrounded by at least one white pixel
 // image format is Grayscale8Unorm
 fn find_hull_pixels(image: &Image) -> Vec<(i32, i32)> {
   let mut hull_pixels = Vec::new();
 
   for y in 0..image.texture_descriptor.size.height {
-    for x in 0..image.texture_descriptor.size.width {
+    /*for x in 0..image.texture_descriptor.size.width {
       let index = ((x + y * image.texture_descriptor.size.width) * 4) as usize;
-      let pixel = image.data[index];
-      if pixel == 0 {
-        let mut neighbors = 0;
+      print!("{}", if image.data[index+3] > 0 { "X" } else { " " });
+    }
+    println!();*/
+
+    for x in 0..image.texture_descriptor.size.width {
+      if is_ground_pixel(image, x as i32, y as i32) {
+        let mut direct_neighbors = 0;
+        let mut diagonal_neighbors = 0;
 
         for dy in -1..=1 {
           for dx in -1..=1 {
-            if dx != 0 && dy != 0 || dx == 0 && dy == 0 {
+            if dx == 0 && dy == 0 {
               continue;
             }
+            let neighbors = if dx != 0 && dy != 0 {
+              &mut diagonal_neighbors
+            } else {
+              &mut direct_neighbors
+            };
 
             let nx = x as i32 + dx;
             let ny = y as i32 + dy;
-
-            let is_black = if nx < 0 || nx >= image.texture_descriptor.size.width as i32 {
-              false
-            } else if ny < 0 || ny >= image.texture_descriptor.size.height as i32 {
-              false
-            } else {
-              let nindex = ((nx + ny * image.texture_descriptor.size.width as i32) * 4) as usize;
-              let npixel = image.data[nindex];
-              npixel == 0
-            };
-
-            if is_black {
-              neighbors += 1;
+            if is_ground_pixel(image, nx, ny) {
+              *neighbors += 1;
             }
           }
         }
 
-        if 2 <= neighbors && neighbors <= 3 {
+        if direct_neighbors <= 3 /*|| diagonal_neighbors == 3*/ {
           hull_pixels.push((x as i32, y as i32));
         }
       }
@@ -308,9 +373,9 @@ fn render_hull_to_image(image: &Image, hull_pixels: &Vec<(i32, i32)>) -> Image {
       let is_hull = hull_pixels.contains(&(x as i32, y as i32));
 
       if is_hull {
-        new_image.data[index] = 0xff;
-        new_image.data[index + 1] = 0x00;
-        new_image.data[index + 2] = 0x00;
+        new_image.data[index] = 0x88;
+        new_image.data[index + 1] = 0x88;
+        new_image.data[index + 2] = 0x88;
         new_image.data[index + 3] = 0xff;
       } else {
         // copy old
@@ -325,29 +390,46 @@ fn render_hull_to_image(image: &Image, hull_pixels: &Vec<(i32, i32)>) -> Image {
   new_image
 }
 
-fn convert_vec2(v: Vec2) -> Vec2 {
-  Vec2::new(v.x - 149.5, -v.y + 149.5)
+fn sync_camera_to_player(query: Query<&Transform, With<Player>>, mut query2: Query<&mut Transform, (With<Camera>, Without<Player>)>) {
+  let Ok(player_transform) = query.get_single() else {
+    return;
+  };
+  let Ok(mut camera_transform) = query2.get_single_mut() else {
+    return;
+  };
+  camera_transform.translation.x = player_transform.translation.x;
+  camera_transform.translation.y = player_transform.translation.y;
 }
 
-fn draw_line(gizmos: &mut Gizmos, start: Vec2, end: Vec2, color0: Color, color1: Color) {
+fn convert_vec2(v: Vec2, image: &Image) -> Vec2 {
+  Vec2::new(v.x, -v.y)
+}
+
+fn draw_line(gizmos: &mut Gizmos, start: Vec2, end: Vec2, color0: Color, color1: Color, image: &Image) {
   let mut cur = start;
   let mut next = end;
 
-  gizmos.line_gradient_2d(convert_vec2(cur), convert_vec2(next), color0, color1);
+  gizmos.line_gradient_2d(convert_vec2(cur, image), convert_vec2(next, image), color0, color1);
 }
 
-fn render_strip(mut gizmos: Gizmos, hull_handle: Option<ResMut<HullHandle>>, keyboard_input: Res<Input<KeyCode>>) {
-  return;
+fn render_strip(
+  mut gizmos: Gizmos,
+  hull_handle: Option<ResMut<HullHandle>>,
+  keyboard_input: Res<Input<KeyCode>>,
+  images: ResMut<Assets<Image>>,
+) {
+  //return;
   let hull_handle = match hull_handle {
     Some(hull_handle) => hull_handle,
     None => return,
   };
 
+  let image = images.get(&hull_handle.0).unwrap();
   let hulls = &hull_handle.2;
 
   for hull in hulls.iter() {
-    if !keyboard_input.pressed(KeyCode::AltLeft) {
-      let polygons = split_into_convex_polygons(hull, Some(&mut gizmos));
+    if keyboard_input.pressed(KeyCode::AltLeft) {
+      let polygons = split_into_convex_polygons(hull, Some(&mut gizmos), image);
       for polygon in polygons.iter() {
         for i in 0..polygon.len() {
           let cur = hull[polygon[i]];
@@ -359,6 +441,7 @@ fn render_strip(mut gizmos: Gizmos, hull_handle: Option<ResMut<HullHandle>>, key
             next,
             Color::rgb(0.5, 0.5, 1.0),
             Color::rgb(0.5, 1.0, 0.5),
+            image
           );
         }
       }
@@ -373,6 +456,7 @@ fn render_strip(mut gizmos: Gizmos, hull_handle: Option<ResMut<HullHandle>>, key
           next,
           Color::rgb(0.5, 0.5, 1.0),
           Color::rgb(0.5, 1.0, 0.5),
+          image,
         );
       }
     }
@@ -381,8 +465,8 @@ fn render_strip(mut gizmos: Gizmos, hull_handle: Option<ResMut<HullHandle>>, key
 
 // a system that changes the z position of all MySprite components when the space bar is pressed
 fn flip_sprites(mut query: Query<(&mut Visibility, &mut MySprite)>, keyboard_input: Res<Input<KeyCode>>) {
-  return;
-  if keyboard_input.just_pressed(KeyCode::Space) {
+  //return;
+  if keyboard_input.just_pressed(KeyCode::F5) {
     println!("Flipping sprites!");
     for (mut vis, mut sprite) in query.iter_mut() {
       sprite.0 = (sprite.0 + 1) % 3;
@@ -562,7 +646,7 @@ fn remove_least_errorful_hull_vec(hull: &mut Vec<Vec2>, max_remove: f32) -> bool
   };
 
   if area <= max_remove {
-    println!("Removing hull vec with area: {}", area);
+    //println!("Removing hull vec with area: {}", area);
 
     hull.remove(i);
     true
@@ -571,7 +655,7 @@ fn remove_least_errorful_hull_vec(hull: &mut Vec<Vec2>, max_remove: f32) -> bool
   }
 }
 
-fn split_into_convex_polygons(hull: &Vec<Vec2>, gizmos: Option<&mut Gizmos>) -> Vec<Vec<usize>> {
+fn split_into_convex_polygons(hull: &Vec<Vec2>, gizmos: Option<&mut Gizmos>, image: &Image) -> Vec<Vec<usize>> {
   let mut indices: Vec<usize> = (0..hull.len()).collect();
   let mut polygons = Vec::new();
 
@@ -618,7 +702,7 @@ fn split_into_convex_polygons(hull: &Vec<Vec2>, gizmos: Option<&mut Gizmos>) -> 
               let cur = hull[indices[i]];
               let next = hull[indices[(i + 1) % indices.len()]];
 
-              draw_line(gizmos, cur, next, Color::rgb(1.0, 0.0, 0.), Color::rgb(1.0, 0., 0.));
+              draw_line(gizmos, cur, next, Color::rgb(1.0, 0.0, 0.), Color::rgb(1., 1., 1.), image);
             }
           }
           polygons.push(indices);
